@@ -106,32 +106,6 @@ static struct circ_buf *circ_buf_write(struct circ_buf *cbuf, uint32_t obj)
 
     return cbuf;
 }
-
-static uint32_t circ_buf_read(struct circ_buf *cbuf)
-{
-    if (!cbuf) {
-        return -EINVAL;
-    }
-    if (cbuf->start == cbuf->end) {
-        return -1; /* nothing to read */
-    }
-
-    return cbuf->buf[cbuf->start];
-}
-
-static struct circ_buf *circ_buf_move_head(struct circ_buf *cbuf)
-{
-    if (!cbuf) {
-        return 0; /* null pointer */
-    }
-    if (cbuf->start == cbuf->end) {
-        return 0; /* empty buffer */
-    }
-
-    cbuf->start = (cbuf->start + 1) % cbuf->size;
-
-    return cbuf;
-}
 /* end circular buffer */
 
 /* for allocating minors */
@@ -206,14 +180,44 @@ static irqreturn_t irq_handler(int irq, void *dev_id)
 {
     struct pci_dev *pdev = dev_id;
     struct monter_data *data = pci_get_drvdata(pdev);
+    int counter;
+    struct list_head *pos, *q;
+    struct context_list_elem *list_context;
 
-
-    if (pdev->device != MONTER_DEVICE_ID) {
+    if (!ioread32(data->iomap + MONTER_INTR_NOTIFY)) {
         return IRQ_NONE;
     }
 
-    iowrite32(MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD | MONTER_INTR_FIFO_OVERFLOW,
-              data->iomap + MONTER_INTR);
+    /* disable monter so that it doesn't change the counter registry */
+    iowrite32(0, data->iomap + MONTER_ENABLE);
+
+    counter = ioread32(data->iomap + MONTER_COUNTER);
+
+    /* find all contexts waiting for this or earlier counter */
+    /* decrease their command count and if 0 then wake and delete from the list */
+    list_for_each_safe(pos, q , &data->cmd_completion_wait_list) {
+        list_context = list_entry(pos, struct context_list_elem, list);
+
+        if (list_context->counter <= counter) {
+            if (atomic_dec_and_test(&list_context->user_data->cmd_count)) {
+                wake_up_all(&list_context->user_data->fsync_queue);
+                list_del(pos);
+                kfree(list_context);
+            }
+
+            if (list_context->counter == counter) {
+                break;
+            }
+        }
+    }
+
+    /* move read pointer */
+    data->cmd_buf->start = counter + 1;
+
+    /* clear interrupts and enable the device back */
+    iowrite32(MONTER_INTR_NOTIFY, data->iomap + MONTER_INTR);
+    iowrite32(MONTER_ENABLE_CALC | MONTER_ENABLE_FETCH_CMD, data->iomap + MONTER_ENABLE);
+
     return IRQ_HANDLED;
 }
 
@@ -320,7 +324,7 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
               data->iomap + MONTER_INTR);
 
     /* switch on interrupts */
-    iowrite32(MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD, data->iomap + MONTER_INTR_ENABLE);
+    iowrite32(MONTER_INTR_NOTIFY, data->iomap + MONTER_INTR_ENABLE);
 
     /* loop the command block */
     cpu_addr[MONTER_CMD_CNT - 1] = MONTER_CMD_JUMP(dma_handle);
