@@ -23,13 +23,65 @@
 #define MONTER_NAME "monter"
 #define MONTER_MAX_MEMORY_SIZE 65536
 #define MONTER_CMD_SIZE sizeof(uint32_t)
-#define BAR0 0
 #define MONTER_CMD_CNT 1024
 #define DMA_SIZE (MONTER_CMD_CNT * MONTER_CMD_SIZE)
+#define BAR0 0
 
 typedef irqreturn_t (*irq_handler_t)(int irq, void *dev);
 
-/* prototypes */
+/*=============== PRIVATE STRUCTS ===========================================*/
+
+/* private struct for handling devices */
+struct monter_data {
+    dev_t numbers;
+    struct device *device;
+    struct device *pdev_dev;
+    struct cdev cdev;
+    void __iomem *iomap;
+
+    struct circ_buf *cmd_buf;
+    dma_addr_t dma_handle_cmd_buf;
+
+    spinlock_t dev_lock;
+    struct mutex mutex;
+    wait_queue_head_t write_queue;
+
+    struct context *last_served;
+    struct list_head cmd_completion_wait_list;
+
+    dma_addr_t dma_handle_empty_page;
+    void *cpu_addr_empty_page;
+};
+
+/* private struct for handling individual users of the device */
+struct context {
+    struct monter_data *device;
+    atomic_t cmd_count;
+
+    uint32_t addr_a;
+    uint32_t addr_b;
+
+    int addr_set;
+    unsigned long data_block_size;
+    uint32_t *data_block;
+    dma_addr_t dma_handle_data_block;
+
+    spinlock_t user_lock;
+    wait_queue_head_t fsync_queue;
+    struct mutex mutex;
+
+    atomic_t ref_count;
+};
+
+/* private struct for contexts waiting for their commands to complete */
+struct context_list_elem {
+    struct list_head list;
+    struct context *user_data;
+    unsigned long counter;
+};
+
+/*=============== PROTOTYPES ================================================*/
+
 static int probe(struct pci_dev *pdev, const struct pci_device_id *id);
 static void remove(struct pci_dev *pdev);
 
@@ -39,9 +91,47 @@ static int monter_mmap(struct file *, struct vm_area_struct *);
 static ssize_t monter_write(struct file *, const char __user *, size_t, loff_t *);
 static int monter_fsync(struct file *, loff_t, loff_t, int datasync);
 static int monter_release(struct inode *, struct file *);
-/* end prototypes */
 
-/* circular buffer */
+static void monter_vma_open(struct vm_area_struct *);
+static void monter_vma_close(struct vm_area_struct *);
+static void context_ref_count_dec(struct context *);
+
+/*=============== GLOBAL VARS ===============================================*/
+
+/* for allocating minors */
+static DEFINE_IDR(monter_minor_idr);
+
+static const struct file_operations monter_fops = {
+        .owner = THIS_MODULE,
+        .open = monter_open,
+        .release = monter_release,
+        .unlocked_ioctl = monter_ioctl,
+        .mmap = monter_mmap,
+        .write = monter_write,
+        .fsync = monter_fsync,
+};
+
+static struct vm_operations_struct monter_vm_ops = {
+        .open = monter_vma_open,
+        .close = monter_vma_close,
+};
+
+static dev_t first_dev;
+static struct class *monter_class;
+
+static const struct pci_device_id pci_ids[] = {
+        { PCI_DEVICE(MONTER_VENDOR_ID, MONTER_DEVICE_ID) },
+        { 0, },
+};
+static struct pci_driver monter_driver = {
+        .name = MONTER_NAME,
+        .id_table = pci_ids,
+        .probe = probe,
+        .remove = remove,
+};
+
+/*=============== CIRCULAR BUFFER ===========================================*/
+
 struct circ_buf {
     uint32_t *buf;
     int size; /* in sizeof(uint32_t) */
@@ -97,7 +187,7 @@ static struct circ_buf *circ_buf_write(struct circ_buf *cbuf, uint32_t obj)
     if (!cbuf) {
         return 0;
     }
-    if (circ_buf_space(cbuf) == 0) { /* no space */
+    if (!circ_buf_space(cbuf)) { /* no space */
             return 0;
     }
 
@@ -106,120 +196,86 @@ static struct circ_buf *circ_buf_write(struct circ_buf *cbuf, uint32_t obj)
 
     return cbuf;
 }
-/* end circular buffer */
 
-/* for allocating minors */
-static DEFINE_IDR(monter_minor_idr);
+static struct circ_buf *circ_buf_move_read_ptr(struct circ_buf *cbuf, int pos)
+{
+    if (!cbuf) {
+        return 0;
+    }
 
-/* private struct for handling devices */
-struct monter_data {
-    dev_t numbers;
-    struct device *device;
-    struct device *pdev_dev;
-    struct cdev cdev;
-    void __iomem *iomap;
-    struct circ_buf *cmd_buf;
-    dma_addr_t dma_handle_cmd_buf;
-    spinlock_t dev_lock;
-    wait_queue_head_t write_queue;
-    struct context *last_served;
-    struct list_head cmd_completion_wait_list;
+    cbuf->start = pos % cbuf->size;
 
-    dma_addr_t dma_handle_empty_page;
-    void *cpu_addr_empty_page;
-};
+    return cbuf;
+}
 
-/* private struct for handling individual users of the device */
-struct context {
-    struct monter_data *device;
-    atomic_t cmd_count;
-    uint32_t addr_a;
-    uint32_t addr_b;
-    unsigned long data_block_size;
-    uint32_t *data_block;
-    dma_addr_t dma_handle_data_block;
-    /* synchronizacja */
-    spinlock_t user_lock;
-    wait_queue_head_t fsync_queue;
-    struct mutex mutex;
-};
+/*=============== INTERRUPT HANDLER =========================================*/
 
-/* private struct for contexts waiting for their commands to complete */
-struct context_list_elem {
-    struct list_head list;
-    struct context *user_data;
-    unsigned long counter;
-};
-
-static const struct file_operations monter_fops = {
-    .owner = THIS_MODULE,
-    .open = monter_open,
-    .release = monter_release,
-    .unlocked_ioctl = monter_ioctl,
-    .mmap = monter_mmap,
-    .write = monter_write,
-    .fsync = monter_fsync,
-};
-
-static dev_t first_dev;
-static struct class *monter_class;
-
-static const struct pci_device_id pci_ids[] = {
-    { PCI_DEVICE(MONTER_VENDOR_ID, MONTER_DEVICE_ID) },
-    { 0, },
-};
-static struct pci_driver monter_driver = {
-    .name = MONTER_NAME,
-    .id_table = pci_ids,
-    .probe = probe,
-    .remove = remove,
-};
-
-/* nie może blokować!!! */
 static irqreturn_t irq_handler(int irq, void *dev_id)
 {
     struct pci_dev *pdev = dev_id;
-    struct monter_data *data = pci_get_drvdata(pdev);
+    struct monter_data *data;
     int counter;
     struct list_head *pos, *q;
     struct context_list_elem *list_context;
+    unsigned long flags;
 
-    if (!ioread32(data->iomap + MONTER_INTR_NOTIFY)) {
+    data = pci_get_drvdata(pdev);
+    if (!data) {
+        printk(KERN_INFO "can't retrieve monter's data\n");
         return IRQ_NONE;
     }
 
-    /* disable monter so that it doesn't change the counter registry */
-    iowrite32(0, data->iomap + MONTER_ENABLE);
+    if (!(ioread32(data->iomap + MONTER_INTR) &
+            (MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD | MONTER_INTR_FIFO_OVERFLOW))) {
+        return IRQ_NONE;
+    }
 
-    counter = ioread32(data->iomap + MONTER_COUNTER);
+    if (!ioread32(data->iomap + MONTER_INTR) & MONTER_INTR_NOTIFY) {
+        goto out;
+    }
+
+    /* disable monter so that it doesn't change the counter registry */
+    iowrite32((uint32_t) 0, data->iomap + MONTER_ENABLE);
+
+    counter = ioread32(data->iomap + MONTER_COUNTER) & 0xffffff;
+
+    spin_lock_irqsave(&data->dev_lock, flags);
 
     /* find all contexts waiting for this or earlier counter */
     /* decrease their command count and if 0 then wake and delete from the list */
     list_for_each_safe(pos, q , &data->cmd_completion_wait_list) {
         list_context = list_entry(pos, struct context_list_elem, list);
 
-        if (list_context->counter <= counter) {
-            if (atomic_dec_and_test(&list_context->user_data->cmd_count)) {
-                wake_up_all(&list_context->user_data->fsync_queue);
-                list_del(pos);
-                kfree(list_context);
-            }
+        if (atomic_dec_and_test(&list_context->user_data->cmd_count)) {
+            wake_up_all(&list_context->user_data->fsync_queue);
+        }
+        list_del(pos);
+        kfree(list_context);
 
-            if (list_context->counter == counter) {
-                break;
-            }
+        if (list_context->counter == counter) {
+            break;
         }
     }
 
     /* move read pointer */
-    data->cmd_buf->start = counter + 1;
+    circ_buf_move_read_ptr(data->cmd_buf, counter + 1);
+    spin_unlock_irqrestore(&data->dev_lock, flags);
 
+    /* there might be space in the command buffer */
+    wake_up_all(&data->write_queue);
+
+    goto out;
+
+out:
     /* clear interrupts and enable the device back */
-    iowrite32(MONTER_INTR_NOTIFY, data->iomap + MONTER_INTR);
-    iowrite32(MONTER_ENABLE_CALC | MONTER_ENABLE_FETCH_CMD, data->iomap + MONTER_ENABLE);
+    iowrite32((uint32_t) (MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD | MONTER_INTR_FIFO_OVERFLOW),
+              data->iomap + MONTER_INTR);
+    iowrite32((uint32_t) (MONTER_ENABLE_CALC | MONTER_ENABLE_FETCH_CMD), data->iomap + MONTER_ENABLE);
 
     return IRQ_HANDLED;
 }
+
+/*=============== DEVICE OPERATIONS =========================================*/
 
 static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -252,7 +308,8 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto out_cdev;
     }
 
-    data->device = device_create(monter_class, &pdev->dev, data->numbers, 0, "%s%d", MONTER_NAME, MINOR(data->numbers));
+    data->device = device_create(monter_class, &pdev->dev, data->numbers,
+                                 0, "%s%d", MONTER_NAME, MINOR(data->numbers));
     if (IS_ERR(data->device)) {
         printk(KERN_INFO "error in creating device for monter\n");
         ret = PTR_ERR(data->device);
@@ -265,7 +322,7 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto out_device;
     }
 
-    ret = pci_request_regions(pdev, MONTER_NAME);  /* TODO z dokumentacji PCI najpierw enable, potem request regions, sprawdzić */
+    ret = pci_request_regions(pdev, MONTER_NAME);
     if (ret < 0) {
         printk(KERN_INFO "error in requesting regions for monter\n");
         goto out_enable;
@@ -310,33 +367,37 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto out_dma;
     }
 
-    ret = request_irq(pdev->irq, irq_handler, IRQF_SHARED, MONTER_NAME, pdev);   /* TODO upewnić się że nie ma wiszących przerwań */
-    if (ret < 0) {                                                               /* TODO sprawdzić czy name nie musi być z minorem */
-        printk(KERN_INFO "error in registering interrupt handler for monter\n");
-        goto out_empty_page;
-    }
-
+    mutex_init(&data->mutex);
+    spin_lock_init(&data->dev_lock);
     init_waitqueue_head(&data->write_queue);
     INIT_LIST_HEAD(&data->cmd_completion_wait_list);
+    /* loop the command block */
+    cpu_addr[MONTER_CMD_CNT - 1] = MONTER_CMD_JUMP(dma_handle);
+
+
+    iowrite32(MONTER_RESET_CALC | MONTER_RESET_FIFO, data->iomap + MONTER_RESET);
 
     /* clear interrupts */
     iowrite32(MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD | MONTER_INTR_FIFO_OVERFLOW,
               data->iomap + MONTER_INTR);
 
-    /* switch on interrupts */
-    iowrite32(MONTER_INTR_NOTIFY, data->iomap + MONTER_INTR_ENABLE);
-
-    /* loop the command block */
-    cpu_addr[MONTER_CMD_CNT - 1] = MONTER_CMD_JUMP(dma_handle);
-
     /* pass command block addresses */
     iowrite32(dma_handle, data->iomap + MONTER_CMD_READ_PTR);
     iowrite32(dma_handle, data->iomap + MONTER_CMD_WRITE_PTR);
 
+    /* switch on interrupts */
+    iowrite32(MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD | MONTER_INTR_FIFO_OVERFLOW,
+              data->iomap + MONTER_INTR_ENABLE);
+
     /* switch on the device */
     iowrite32(MONTER_ENABLE_CALC | MONTER_ENABLE_FETCH_CMD, data->iomap + MONTER_ENABLE);
 
-    printk(KERN_INFO "probe successful for monter\n");
+    ret = request_irq(pdev->irq, irq_handler, IRQF_SHARED, MONTER_NAME, pdev);
+    if (ret < 0) {
+        printk(KERN_INFO "error in registering interrupt handler for monter\n");
+        goto out_empty_page;
+    }
+
     ret = 0;
     goto out;
 
@@ -365,7 +426,6 @@ out:
     return ret;
 }
 
-/* TODO sprawdzić kolejność */
 static void remove(struct pci_dev *pdev)
 {
     struct monter_data *data;
@@ -376,11 +436,16 @@ static void remove(struct pci_dev *pdev)
         return;
     }
 
-    /* czyszczenie bloku liczącego i kolejki poleceń */
+    iowrite32(MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD | MONTER_INTR_FIFO_OVERFLOW,
+              data->iomap + MONTER_INTR);
+    iowrite32((uint32_t) 0, data->iomap + MONTER_INTR_ENABLE);
+    iowrite32((uint32_t) 0, data->iomap + MONTER_ENABLE);
     iowrite32(MONTER_RESET_CALC | MONTER_RESET_FIFO, data->iomap + MONTER_RESET);
 
-
-    dma_free_coherent(&pdev->dev, DMA_SIZE, data->cmd_buf->buf, data->dma_handle_cmd_buf); /* TODO upewnić się że urządzenie nie korzysta z dma */
+    dma_free_coherent(&pdev->dev, DMA_SIZE, data->cmd_buf->buf, data->dma_handle_cmd_buf);
+    dma_free_coherent(&pdev->dev, MONTER_PAGE_SIZE, data->cpu_addr_empty_page,
+                      data->dma_handle_empty_page);
+    pci_clear_master(pdev);
     pci_iounmap(pdev, data->iomap);
     device_destroy(monter_class, data->numbers);
     cdev_del(&data->cdev);
@@ -392,7 +457,7 @@ static void remove(struct pci_dev *pdev)
     kfree(data);
     pci_set_drvdata(pdev, 0);
 
-    free_irq(pdev->irq, (void *) pdev); /* TODO upewnić się że monter już nie zgłosi przerwań */
+    free_irq(pdev->irq, (void *) pdev);
     pci_release_regions(pdev);
     pci_disable_device(pdev);
 
@@ -439,72 +504,84 @@ static void __exit monter_cleanup(void)
     pci_unregister_driver(&monter_driver);
     unregister_chrdev_region(first_dev, MONTER_MAX_DEVS);
     class_destroy(monter_class);
-    printk(KERN_INFO "papa\n");
     return;
 }
 
-static int validate_commands(uint32_t* commands, size_t count, struct context *user_data) {
+static int validate_commands(uint32_t *commands, size_t count,
+                             struct context *user_data,
+                             uint32_t *addr_a, uint32_t *addr_b, int *addr_set)
+{
     int i;
-    uint32_t cmd, addr_a, addr_b, addr_d, size;
+    uint32_t cmd, size, addr_d;
 
     if (!commands) {
         return -EINVAL;
     }
 
-
     for (i = 0; i < count; ++i) {
         cmd = commands[i];
-        addr_a = user_data->addr_a;
-        addr_b = user_data->addr_b;
 
-        switch (MONTER_CMD_KIND(cmd)) {
-            case MONTER_CMD_KIND_ADDR_AB:
-                addr_a = MONTER_CMD_ADDR_A(cmd);
-                if (addr_a >= user_data->data_block_size) {
+        switch (MONTER_SWCMD_TYPE(cmd)) {
+            case MONTER_SWCMD_TYPE_ADDR_AB:
+                *addr_a = MONTER_SWCMD_ADDR_A(cmd);
+                *addr_b = MONTER_SWCMD_ADDR_B(cmd);
+                *addr_set = 1;
+
+                if (*addr_a >= user_data->data_block_size) {
                     return -EINVAL;
                 }
 
-                addr_b = MONTER_CMD_ADDR_B(cmd);
-                if (addr_b >= user_data->data_block_size) {
+                if (*addr_b >= user_data->data_block_size) {
                     return -EINVAL;
                 }
-                user_data->addr_a = addr_a;
-                user_data->addr_b = addr_b;
                 break;
-            case MONTER_CMD_KIND_RUN:
-                if (!addr_a || !addr_b) {
+
+            case MONTER_SWCMD_TYPE_RUN_MULT:
+                if (!*addr_set) {
                     return -EINVAL;
                 }
-
                 if (cmd & (1 << 17)) {
                     return -EINVAL;
                 }
 
-                addr_d = MONTER_CMD_ADDR_D(cmd);
-                size = MONTER_CMD_RUN_SIZE(cmd);
+                addr_d = MONTER_SWCMD_ADDR_D(cmd);
+                size = MONTER_SWCMD_RUN_SIZE(cmd);
 
-                switch (MONTER_CMD_SUBTYPE(cmd)) {
-                    case MONTER_CMD_SUBTYPE_RUN_MULT:
-                        if (addr_a + (size + 1) >= user_data->data_block_size) {
-                            return -EINVAL;
-                        }
-                        if (addr_b + (size + 1) >= user_data->data_block_size) {
-                            return -EINVAL;
-                        }
-                        if (addr_d + (size + 1)*2 >= user_data->data_block_size) {
-                            return -EINVAL;
-                        }
-                        break;
-                    case MONTER_CMD_SUBTYPE_RUN_REDC:
-                        if (addr_d + (size + 1)*2 >= user_data->data_block_size) {
-                            return -EINVAL;
-                        }
-                        if (addr_b + (size + 1) >= user_data->data_block_size) {
-                            return -EINVAL;
-                        }
-                        break;
+                if (*addr_a + size*MONTER_CMD_SIZE - 1 > user_data->data_block_size) {
+                    return -EINVAL;
+                }
+                if (*addr_b + size*MONTER_CMD_SIZE - 1 > user_data->data_block_size) {
+                    return -EINVAL;
+                }
+                if (addr_d + size*MONTER_CMD_SIZE*2 - 1 > user_data->data_block_size) {
+                    return -EINVAL;
                 }
                 break;
+
+            case MONTER_SWCMD_TYPE_RUN_REDC:
+                if (!*addr_set) {
+                    return -EINVAL;
+                }
+                if (cmd & (1 << 17)) {
+                    return -EINVAL;
+                }
+
+                addr_d = MONTER_SWCMD_ADDR_D(cmd);
+                size = MONTER_SWCMD_RUN_SIZE(cmd);
+
+                if (*addr_a + MONTER_CMD_SIZE - 1 > user_data->data_block_size) {
+                    return -EINVAL;
+                }
+                if (*addr_b + size*MONTER_CMD_SIZE - 1 > user_data->data_block_size) {
+                    return -EINVAL;
+                }
+                if (addr_d + size*MONTER_CMD_SIZE*2 - 1 > user_data->data_block_size) {
+                    return -EINVAL;
+                }
+                break;
+
+            default:
+                return -EINVAL;
         }
     }
 
@@ -530,6 +607,7 @@ static int monter_open(struct inode *inode, struct file *filp)
     spin_lock_init(&user_data->user_lock);
     mutex_init(&user_data->mutex);
     atomic_set(&user_data->cmd_count, 0);
+    atomic_set(&user_data->ref_count, 1);
 
     filp->private_data = user_data;
 
@@ -581,28 +659,54 @@ out:
 static int monter_mmap(struct file *filp, struct vm_area_struct *vma)
 {
     int ret;
-    struct context *con = filp->private_data;
+    struct context *user_data = filp->private_data;
     unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-    unsigned long psize = con->data_block_size - offset;
+    unsigned long psize = user_data->data_block_size - offset;
     unsigned long vsize = vma->vm_end - vma->vm_start;
-    unsigned long phys_addr = virt_to_phys(con->data_block);
+    unsigned long phys_addr = (virt_to_phys(user_data->data_block) >> PAGE_SHIFT) + offset;
 
-    if (vma->vm_flags != VM_SHARED) {
-        return -EINVAL;
+    mutex_lock(&user_data->mutex);
+    if (!user_data->data_block) { /* mmap before ioctl */
+        printk(KERN_INFO "error in monter: mmap before ioctl\n");
+        ret = -EINVAL;
+        mutex_unlock(&user_data->mutex);
+        goto out;
+    }
+    mutex_unlock(&user_data->mutex);
+
+    if (!(vma->vm_flags & VM_SHARED)) {
+        printk(KERN_INFO "error in monter: wrong flags in mmap\n");
+        ret = -EINVAL;
+        goto out;
     }
 
     if (vsize > psize) {
-        return -EINVAL;
+        printk(KERN_INFO "error in monter: wrong size in mmap\n");
+        ret = -EINVAL;
+        goto out;
     }
 
-    ret = remap_pfn_range(vma, vma->vm_start, (phys_addr + offset) >> PAGE_SHIFT,
-                    con->data_block_size, vma->vm_page_prot);
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+    vma->vm_flags |= VM_IO;
+
+    ret = remap_pfn_range(vma, vma->vm_start, phys_addr,
+                          vsize, vma->vm_page_prot);
 
     if (ret < 0) {
-        return -EAGAIN;
+        printk(KERN_INFO "error in monter: remap_pfn_range failed\n");
+        ret = -EAGAIN;
+        goto out;
     }
 
-    return 0;
+    vma->vm_ops = &monter_vm_ops;
+    vma->vm_private_data = user_data;
+    monter_vma_open(vma);
+
+    ret = 0;
+    goto out;
+
+out:
+    return ret;
 }
 
 static ssize_t monter_write(struct file *filp, const char *buf, size_t count, loff_t *fpos)
@@ -610,17 +714,17 @@ static ssize_t monter_write(struct file *filp, const char *buf, size_t count, lo
     int ret, i;
     struct context *user_data = filp->private_data;
     struct monter_data *dev = user_data->device;
+    struct context_list_elem *entry;
+    unsigned long flags;
     uint32_t *commands;
     uint32_t addr_a, addr_b, addr_d, sizeM1, cmd;
-    int space_needed = 2; /* at least one command plus counter */
-    unsigned long flags;
-    size_t to_read, read = 0;
-    int page_cnt, unused_page_cnt, free_space, cmds_to_send, cmds_sent, cmd_pack;
-    int counter_index;
-    struct context_list_elem *entry;
+    size_t to_read, read;
+    int page_cnt, free_space, cmds_to_send, cmds_sent, cmd_pack, counter_index, addr_set;
+    int space_needed = 2; /* default minimum for one command + counter */
 
     mutex_lock(&user_data->mutex);
     if (!user_data->data_block) { /* write before ioctl */
+        printk(KERN_INFO "error in monter: write before ioctl\n");
         ret = -EINVAL;
         mutex_unlock(&user_data->mutex);
         goto out;
@@ -628,42 +732,53 @@ static ssize_t monter_write(struct file *filp, const char *buf, size_t count, lo
     mutex_unlock(&user_data->mutex);
 
     if (count % MONTER_CMD_SIZE) {
+        printk(KERN_INFO "error in monter: unaligned write\n");
         ret = -EINVAL;
         goto out;
     }
 
-    commands = kmalloc(MONTER_CMD_CNT*MONTER_CMD_SIZE, GFP_KERNEL);
+    commands = kzalloc(MONTER_CMD_CNT*MONTER_CMD_SIZE, GFP_KERNEL);
     if (!commands) {
+        printk(KERN_INFO "error in monter: memory allocation failed\n");
         ret = -ENOMEM;
         goto out;
     }
 
+    mutex_lock(&user_data->mutex);
+
     addr_a = user_data->addr_a;
     addr_b = user_data->addr_b;
+    addr_set = user_data->addr_set;
+
+    read = 0;
     while (read < count) {
-        to_read = min(sizeof(commands)*sizeof(uint32_t), count-read);
+        to_read = min(MONTER_CMD_CNT*MONTER_CMD_SIZE, count-read);
+
         if (copy_from_user(commands, buf+read, to_read)) {
+            printk(KERN_INFO "error in monter: copy_from_user failed\n");
             ret = -EFAULT;
+            mutex_unlock(&user_data->mutex);
             goto out_malloc;
         }
         read += to_read;
 
-        if (validate_commands(commands, count, user_data) < 0) {
+        if (validate_commands(commands, to_read/MONTER_CMD_SIZE, user_data,
+                              &addr_a, &addr_b, &addr_set) < 0) {
+            printk(KERN_INFO "error in monter: command validation failed\n");
             ret = -EINVAL;
-            user_data->addr_a = addr_a;
-            user_data->addr_b = addr_b;
+            mutex_unlock(&user_data->mutex);
             goto out_malloc;
         }
     }
-    user_data->addr_a = addr_a;
-    user_data->addr_b = addr_b;
+    mutex_unlock(&user_data->mutex);
     read = 0;
 
     /* commands validated */
-
     while (read < count) {
         to_read = min(MONTER_CMD_CNT*MONTER_CMD_SIZE, count - read);
+
         if (copy_from_user(commands, buf + read, to_read)) {
+            printk(KERN_INFO "error in monter: copy_from_user failed\n");
             ret = -EFAULT;
             goto out_malloc;
         }
@@ -671,7 +786,7 @@ static ssize_t monter_write(struct file *filp, const char *buf, size_t count, lo
         cmds_to_send = to_read / MONTER_CMD_SIZE;
         cmds_sent = 0;
 
-        spin_lock_irqsave(&dev->dev_lock, flags);
+        mutex_lock(&dev->mutex);
         if (dev->last_served != user_data) {
             /* need to remap pages */
             space_needed = 2 + MONTER_PAGE_NUM;
@@ -679,13 +794,14 @@ static ssize_t monter_write(struct file *filp, const char *buf, size_t count, lo
 
         while (cmds_to_send) {
             /* wait if buffer is full */
-            if (circ_buf_space(dev->cmd_buf) < space_needed) {
+            spin_lock_irqsave(&dev->dev_lock, flags);
+            while (circ_buf_space(dev->cmd_buf) < space_needed) {
                 spin_unlock_irqrestore(&dev->dev_lock, flags);
                 wait_event(dev->write_queue, circ_buf_space(dev->cmd_buf) >= space_needed);
                 spin_lock_irqsave(&dev->dev_lock, flags);
             }
+            spin_unlock_irqrestore(&dev->dev_lock, flags);
 
-            /* check if someone hasn't come in the meantime */
             space_needed = 2;
             if (dev->last_served != user_data) {
                 space_needed += MONTER_PAGE_NUM;
@@ -695,34 +811,47 @@ static ssize_t monter_write(struct file *filp, const char *buf, size_t count, lo
             if (dev->last_served != user_data) {
                 page_cnt = user_data->data_block_size / MONTER_PAGE_SIZE;
                 for (i = 0; i < page_cnt; ++i) {
-                    cmd = MONTER_CMD_PAGE(i, user_data->dma_handle_data_block + i*MONTER_PAGE_SIZE, 0);
+                    cmd = MONTER_CMD_PAGE(i, (uint32_t) user_data->dma_handle_data_block
+                                             + i*MONTER_PAGE_SIZE, 0);
+
+                    spin_lock_irqsave(&dev->dev_lock, flags);
                     circ_buf_write(dev->cmd_buf, cmd);
+                    spin_unlock_irqrestore(&dev->dev_lock, flags);
                 }
 
-                /* map empty space to a special empty page */
-                unused_page_cnt = MONTER_PAGE_NUM - page_cnt;
-                for (i = 0; i < unused_page_cnt; ++i) {
-                    cmd = MONTER_CMD_PAGE(i, dev->dma_handle_empty_page + i*MONTER_PAGE_SIZE, 0);
+                /* map unused space to a special empty page */
+                for (i = page_cnt; i < MONTER_PAGE_NUM; ++i) {
+                    cmd = MONTER_CMD_PAGE(i, dev->dma_handle_empty_page, 0);
+
+                    spin_lock_irqsave(&dev->dev_lock, flags);
                     circ_buf_write(dev->cmd_buf, cmd);
+                    spin_unlock_irqrestore(&dev->dev_lock, flags);
                 }
 
                 /* resend addresses */
-                if (MONTER_CMD_KIND(commands[cmds_sent]) != MONTER_CMD_KIND_ADDR_AB) {
+                if (MONTER_SWCMD_TYPE(commands[cmds_sent]) != MONTER_SWCMD_TYPE_ADDR_AB) {
                     cmd = MONTER_CMD_ADDR_AB(user_data->addr_a, user_data->addr_b, 0);
+
+                    spin_lock_irqsave(&dev->dev_lock, flags);
                     circ_buf_write(dev->cmd_buf, cmd);
+                    spin_unlock_irqrestore(&dev->dev_lock, flags);
                 }
             }
             dev->last_served = user_data;
 
+            spin_lock_irqsave(&dev->dev_lock, flags);
             free_space = circ_buf_space(dev->cmd_buf);
+            spin_unlock_irqrestore(&dev->dev_lock, flags);
+
             free_space--; /* one place for counter */
             cmd_pack = min(free_space, cmds_to_send);
 
             /* allocate memory for the context in a list */
             entry = kmalloc(sizeof(*entry), GFP_KERNEL);
             if (!entry) {
+                printk(KERN_INFO "error in monter: memory allocation failed\n");
                 ret = -ENOMEM;
-                spin_unlock_irqrestore(&dev->dev_lock, flags);
+                mutex_unlock(&dev->mutex);
                 goto out_malloc;
             }
 
@@ -730,29 +859,32 @@ static ssize_t monter_write(struct file *filp, const char *buf, size_t count, lo
             for (i = 0; i < cmd_pack; ++i) {
                 cmd = commands[cmds_sent + i];
 
-                switch (MONTER_CMD_KIND(cmd)) {
-                    case MONTER_CMD_KIND_ADDR_AB:
-                        addr_a = MONTER_CMD_ADDR_A(cmd);
-                        addr_b = MONTER_CMD_ADDR_B(cmd);
+                switch (MONTER_SWCMD_TYPE(cmd)) {
+                    case MONTER_SWCMD_TYPE_ADDR_AB:
+                        addr_a = MONTER_SWCMD_ADDR_A(cmd);
+                        addr_b = MONTER_SWCMD_ADDR_B(cmd);
                         cmd = MONTER_CMD_ADDR_AB(addr_a, addr_b, 0);
+
+                        user_data->addr_a = addr_a;
+                        user_data->addr_b = addr_b;
+                        user_data->addr_set = 1;
                         break;
 
-                    case MONTER_CMD_KIND_RUN:
-                        addr_d = MONTER_CMD_ADDR_D(cmd);
-                        sizeM1 = MONTER_CMD_RUN_SIZE(cmd);
+                    case MONTER_SWCMD_TYPE_RUN_MULT:
+                        addr_d = MONTER_SWCMD_ADDR_D(cmd);
+                        sizeM1 = MONTER_SWCMD_RUN_SIZE(cmd);
+                        cmd = MONTER_CMD_RUN_MULT(sizeM1, addr_d, 0);
+                        break;
 
-                        switch (MONTER_CMD_SUBTYPE(cmd)) {
-                            case MONTER_CMD_SUBTYPE_RUN_REDC:
-                                cmd = MONTER_CMD_RUN_REDC(sizeM1, addr_d, 0);
-                                break;
-
-                            case MONTER_CMD_SUBTYPE_RUN_MULT:
-                                cmd = MONTER_CMD_RUN_MULT(sizeM1, addr_d, 0);
-                                break;
-                        }
+                    case MONTER_SWCMD_TYPE_RUN_REDC:
+                        addr_d = MONTER_SWCMD_ADDR_D(cmd);
+                        sizeM1 = MONTER_SWCMD_RUN_SIZE(cmd);
+                        cmd = MONTER_CMD_RUN_REDC(sizeM1, addr_d, 0);
                         break;
                 }
+                spin_lock_irqsave(&dev->dev_lock, flags);
                 circ_buf_write(dev->cmd_buf, cmd);
+                spin_unlock_irqrestore(&dev->dev_lock, flags);
             }
 
             cmds_sent += cmd_pack;
@@ -761,15 +893,25 @@ static ssize_t monter_write(struct file *filp, const char *buf, size_t count, lo
             /* put a counter after the commands */
             counter_index = dev->cmd_buf->end;
             cmd = MONTER_CMD_COUNTER(counter_index, 1);
+
+            spin_lock_irqsave(&dev->dev_lock, flags);
             circ_buf_write(dev->cmd_buf, cmd);
+            spin_unlock_irqrestore(&dev->dev_lock, flags);
 
             /* put the context with its counter on a list */
             atomic_inc(&user_data->cmd_count);
             entry->user_data = user_data;
             entry->counter = counter_index;
+
+            spin_lock_irqsave(&dev->dev_lock, flags);
             list_add_tail(&entry->list, &dev->cmd_completion_wait_list);
+            spin_unlock_irqrestore(&dev->dev_lock, flags);
+
+            iowrite32(dev->dma_handle_cmd_buf + dev->cmd_buf->end*MONTER_CMD_SIZE,
+                dev->iomap + MONTER_CMD_WRITE_PTR);
+
         }
-        spin_unlock_irqrestore(&dev->dev_lock, flags);
+        mutex_unlock(&dev->mutex);
     }
 
     ret = count;
@@ -785,6 +927,14 @@ static int monter_fsync(struct file *filp, loff_t o1, loff_t o2, int ds)
 {
     struct context *user_data = filp->private_data;
 
+    mutex_lock(&user_data->mutex);
+    if (!user_data->data_block) { /* fsync before ioctl */
+        printk(KERN_INFO "error in monter: fsync before ioctl\n");
+        mutex_unlock(&user_data->mutex);;
+        return -EINVAL;
+    }
+    mutex_unlock(&user_data->mutex);
+
     wait_event(user_data->fsync_queue, atomic_read(&user_data->cmd_count) == 0);
 
     return 0;
@@ -792,26 +942,47 @@ static int monter_fsync(struct file *filp, loff_t o1, loff_t o2, int ds)
 
 static int monter_release(struct inode *n, struct file *filp)
 {
-    /* mmap */
-
     struct context *user_data = filp->private_data;
 
     if (!user_data) {
         return 0;
     }
 
-    monter_fsync(filp, 0, 0, 0);
+    wait_event(user_data->fsync_queue, atomic_read(&user_data->cmd_count) == 0);
 
-    if (user_data->data_block) {
-        dma_free_coherent(user_data->device->pdev_dev, user_data->data_block_size,
-                          user_data->data_block, user_data->dma_handle_data_block);
-    }
+    context_ref_count_dec(user_data);
 
     kfree(user_data);
 
     return 0;
 }
 
+/*=============== VMA OPERATIONS ============================================*/
+
+static void context_ref_count_dec(struct context *user_data) {
+    if (atomic_dec_and_test(&user_data->ref_count)) {
+        dma_free_coherent(user_data->device->pdev_dev,
+                          user_data->data_block_size,
+                          user_data->data_block,
+                          user_data->dma_handle_data_block);
+    }
+}
+
+static void monter_vma_open(struct vm_area_struct *vma)
+{
+    struct context *user_data = vma->vm_private_data;
+
+    atomic_inc(&user_data->ref_count);
+}
+
+static void monter_vma_close(struct vm_area_struct *vma)
+{
+    struct context *user_data = vma->vm_private_data;
+
+    context_ref_count_dec(user_data);
+}
+
+/*=============== MODULE INFO ===============================================*/
 
 module_init(monter_init);
 module_exit(monter_cleanup);
