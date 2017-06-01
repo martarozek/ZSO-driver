@@ -370,7 +370,7 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
     init_waitqueue_head(&data->write_queue);
     INIT_LIST_HEAD(&data->cmd_completion_wait_list);
     /* loop the command block */
-    cpu_addr[MONTER_CMD_CNT - 1] = MONTER_CMD_JUMP(dma_handle);
+    cpu_addr[MONTER_CMD_CNT - 1] = MONTER_CMD_JUMP(data->dma_handle_cmd_buf);
 
 
     iowrite32(MONTER_RESET_CALC | MONTER_RESET_FIFO, data->iomap + MONTER_RESET);
@@ -380,8 +380,8 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
               data->iomap + MONTER_INTR);
 
     /* pass command block addresses */
-    iowrite32(dma_handle, data->iomap + MONTER_CMD_READ_PTR);
-    iowrite32(dma_handle, data->iomap + MONTER_CMD_WRITE_PTR);
+    iowrite32(data->dma_handle_cmd_buf, data->iomap + MONTER_CMD_READ_PTR);
+    iowrite32(data->dma_handle_cmd_buf, data->iomap + MONTER_CMD_WRITE_PTR);
 
     /* switch on interrupts */
     iowrite32(MONTER_INTR_NOTIFY | MONTER_INTR_INVALID_CMD | MONTER_INTR_FIFO_OVERFLOW,
