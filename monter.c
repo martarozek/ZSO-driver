@@ -281,7 +281,6 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
     int ret;
     struct monter_data *data;
-    dma_addr_t dma_handle;
     uint32_t *cpu_addr;
 
     data = kzalloc(sizeof(*data), GFP_KERNEL);
@@ -349,14 +348,13 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto out_master;
     }
 
-    cpu_addr = dma_alloc_coherent(&pdev->dev, DMA_SIZE, &dma_handle, GFP_KERNEL);
+    cpu_addr = dma_alloc_coherent(&pdev->dev, DMA_SIZE, &data->dma_handle_cmd_buf, GFP_KERNEL);
     if (!cpu_addr) {
         printk(KERN_INFO "error in dma allocation for monter\n");
         ret = -ENOMEM;
         goto out_master;
     }
     data->cmd_buf = new_circ_buf(cpu_addr, MONTER_CMD_CNT - 1);
-    data->dma_handle_cmd_buf = dma_handle;
 
     data->cpu_addr_empty_page = dma_alloc_coherent(&pdev->dev, MONTER_PAGE_SIZE,
                                                    &data->dma_handle_empty_page,
@@ -405,7 +403,7 @@ out_empty_page:
     dma_free_coherent(&pdev->dev, MONTER_PAGE_SIZE, data->cpu_addr_empty_page,
                       data->dma_handle_empty_page);
 out_dma:
-    dma_free_coherent(&pdev->dev, DMA_SIZE, cpu_addr, dma_handle);
+    dma_free_coherent(&pdev->dev, DMA_SIZE, cpu_addr, data->dma_handle_cmd_buf);
     destroy_circ_buf(data->cmd_buf);
 out_master:
     pci_clear_master(pdev);
